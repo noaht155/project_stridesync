@@ -26,13 +26,11 @@
 #define MPU_ADDRESS 0x68
 
 // ESP32 I2C pins
-// GPIO 21 and 22 are the default hardware I2C pins on ESP32
 #define SDA_PIN 21
 #define SCL_PIN 22
 
 // FSR analog input pins
 // Must use ADC1 pins only — ADC2 conflicts with WiFi
-// GPIO 32, 33, 34, 35 are all ADC1 safe
 #define FSR_HEEL_PIN 32
 #define FSR_FORE_PIN 33
 
@@ -40,116 +38,208 @@
 #define HAPTIC_PIN 25
 
 // ============================================================
+// CALIBRATION CONSTANTS
+// Number of samples to average during calibration
+// More samples = more accurate bias estimate
+// 1000 samples at 100Hz takes ~10 seconds
+// IMU must be completely stationary during this time
+// ============================================================
+#define CALIB_SAMPLES 1000
+
+// ============================================================
+// CALIBRATION STORAGE
+// One set of offsets per IMU channel (0, 1, 2)
+// Accelerometer offsets in raw LSB units
+// Gyroscope offsets in raw LSB units
+// Converted to physical units during readAndPrintIMU()
+//
+// accelOffset[channel][axis] — axis: 0=X, 1=Y, 2=Z
+// gyroOffset[channel][axis]
+//
+// Z accelerometer target is 16384 (1.0g) not 0
+// because gravity is always present on Z when flat
+// X and Y accelerometer targets are 0
+// All gyro targets are 0 — sensor should read zero when still
+// ============================================================
+float accelOffset[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+float gyroOffset[3][3]  = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+
+// ============================================================
 // MULTIPLEXER CHANNEL CLOSE ALL
 // Writing 0x00 to the PCA9548A closes all channels
-// Called on boot to ensure clean state before any channel
-// is selected — prevents IMU appearing on bus before intended
+// Called on boot to ensure clean state
 // ============================================================
 void tcaCloseAll() {
     Wire.beginTransmission(TCA_ADDRESS);
-    Wire.write(0x00);       // 0x00 closes all 8 channels
+    Wire.write(0x00);
     Wire.endTransmission();
 }
 
 // ============================================================
 // MULTIPLEXER CHANNEL SELECT
-// The PCA9548A has 8 channels (0-7)
-// Writing (1 << channel) to the multiplexer opens that channel
-// For example:
-//   channel 0: writes 0b00000001
-//   channel 1: writes 0b00000010
-//   channel 2: writes 0b00000100
-// Only one channel is open at a time
-// Always call tcaCloseAll() on boot before first tcaSelect()
+// Writing (1 << channel) opens that channel exclusively
 // ============================================================
 void tcaSelect(uint8_t channel) {
-    if (channel > 7) return;        // Safety check — only 8 channels exist
+    if (channel > 7) return;
     Wire.beginTransmission(TCA_ADDRESS);
-    Wire.write(1 << channel);       // Bit shift opens the selected channel
+    Wire.write(1 << channel);
     Wire.endTransmission();
 }
 
 // ============================================================
 // RAW IMU DATA READ
-// MPU6050 stores each axis as a 16-bit signed integer
-// split across two consecutive 8-bit registers
-// High byte comes first, low byte second
-// We read both bytes and combine them:
-//   (highByte << 8) | lowByte = 16-bit value
-// The 'false' in endTransmission keeps the I2C bus active
-// so we can immediately request the data bytes
+// Reads 2 bytes from consecutive registers and combines
+// into a signed 16-bit integer
 // ============================================================
 int16_t readRawData(uint8_t reg) {
     Wire.beginTransmission(MPU_ADDRESS);
-    Wire.write(reg);                // Tell MPU which register to read from
-    Wire.endTransmission(false);    // Keep bus active (repeated start)
-    Wire.requestFrom(MPU_ADDRESS, 2); // Request 2 bytes
-    return (Wire.read() << 8) | Wire.read(); // Combine high and low bytes
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDRESS, 2);
+    return (Wire.read() << 8) | Wire.read();
 }
 
 // ============================================================
 // IMU INITIALISATION
-// MPU6050 starts in sleep mode by default
-// Register 0x6B is the power management register
-// Writing 0x00 to it wakes the device up
-// Must be called after selecting the correct multiplexer channel
+// Wakes MPU6050 from default sleep mode
+// Must be called after selecting correct multiplexer channel
 // ============================================================
 void initIMU() {
     Wire.beginTransmission(MPU_ADDRESS);
-    Wire.write(0x6B);   // Power management register address
-    Wire.write(0x00);   // Write 0 to wake up — clears sleep bit
+    Wire.write(0x6B);
+    Wire.write(0x00);
     Wire.endTransmission();
 }
 
 // ============================================================
+// IMU CALIBRATION
+// Places IMU flat and stationary, averages CALIB_SAMPLES
+// readings to calculate bias offsets for each axis
+//
+// How it works:
+// - Reads raw accelerometer and gyro values repeatedly
+// - Accumulates sum of all readings
+// - Divides by sample count to get average bias
+// - For accel Z: subtracts 16384 (expected 1g in LSB units)
+//   because gravity is real and should not be zeroed out
+// - Stores offsets in accelOffset and gyroOffset arrays
+// - These offsets are subtracted from every subsequent reading
+//
+// Haptic feedback signals calibration stages:
+// - 3 short buzzes: calibration starting, place IMU flat
+// - Slow pulses: calibrating, hold still
+// - 2 long buzzes: calibration complete
+// ============================================================
+void calibrateIMU(uint8_t channel) {
+    tcaSelect(channel);
+
+    Serial.print("Calibrating IMU on channel ");
+    Serial.print(channel);
+    Serial.println(" — hold completely still...");
+
+    // Haptic signal: calibration starting
+    if (MODE_SELECT == 1 || MODE_SELECT == 3) {
+        pinMode(HAPTIC_PIN, OUTPUT);
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(HAPTIC_PIN, HIGH);
+            delay(100);
+            digitalWrite(HAPTIC_PIN, LOW);
+            delay(100);
+        }
+    }
+
+    delay(2000);    // Give user time to place IMU flat and still
+
+    long ax_sum = 0, ay_sum = 0, az_sum = 0;
+    long gx_sum = 0, gy_sum = 0, gz_sum = 0;
+
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
+        tcaSelect(channel);     // Reselect channel each iteration
+                                // in case of I2C bus noise
+
+        ax_sum += readRawData(0x3B);
+        ay_sum += readRawData(0x3D);
+        az_sum += readRawData(0x3F);
+        gx_sum += readRawData(0x43);
+        gy_sum += readRawData(0x45);
+        gz_sum += readRawData(0x47);
+
+        // Haptic pulse every 200 samples to show progress
+        // 5 pulses total across 1000 samples
+        if (i % 200 == 0) {
+            digitalWrite(HAPTIC_PIN, HIGH);
+            delay(50);
+            digitalWrite(HAPTIC_PIN, LOW);
+        }
+
+        delay(5);   // ~200Hz sampling during calibration
+                    // faster than runtime to get clean average quickly
+    }
+
+    // Calculate average offsets
+    // Cast to float before dividing for precision
+    accelOffset[channel][0] = (float)ax_sum / CALIB_SAMPLES;
+    accelOffset[channel][1] = (float)ay_sum / CALIB_SAMPLES;
+    accelOffset[channel][2] = (float)az_sum / CALIB_SAMPLES - 16384.0;
+    // Subtract 16384 from Z accel offset — this is 1g in LSB units
+    // We expect Z to read 16384 when flat so we correct toward that
+    // not toward zero
+
+    gyroOffset[channel][0] = (float)gx_sum / CALIB_SAMPLES;
+    gyroOffset[channel][1] = (float)gy_sum / CALIB_SAMPLES;
+    gyroOffset[channel][2] = (float)gz_sum / CALIB_SAMPLES;
+
+    // Print calculated offsets for verification
+    Serial.print("CH"); Serial.print(channel);
+    Serial.print(" Accel offsets (raw): ");
+    Serial.print(accelOffset[channel][0], 1); Serial.print(", ");
+    Serial.print(accelOffset[channel][1], 1); Serial.print(", ");
+    Serial.println(accelOffset[channel][2], 1);
+
+    Serial.print("CH"); Serial.print(channel);
+    Serial.print(" Gyro offsets (raw): ");
+    Serial.print(gyroOffset[channel][0], 1); Serial.print(", ");
+    Serial.print(gyroOffset[channel][1], 1); Serial.print(", ");
+    Serial.println(gyroOffset[channel][2], 1);
+
+    // Haptic signal: calibration complete
+    digitalWrite(HAPTIC_PIN, HIGH);
+    delay(300);
+    digitalWrite(HAPTIC_PIN, LOW);
+    delay(150);
+    digitalWrite(HAPTIC_PIN, HIGH);
+    delay(300);
+    digitalWrite(HAPTIC_PIN, LOW);
+
+    Serial.println("Calibration complete");
+}
+
+// ============================================================
 // READ AND PRINT ONE IMU
-// Reads all 6 axes from whichever IMU is currently selected
-// via the multiplexer, converts to physical units, prints
+// Reads all 6 axes, subtracts calibration offsets,
+// converts to physical units, prints to serial
 //
-// Accelerometer conversion:
-//   Default range is ±2g
-//   LSB sensitivity is 16384 counts per g
-//   Raw value / 16384.0 = acceleration in g
-//
-// Gyroscope conversion:
-//   Default range is ±250 degrees per second
-//   LSB sensitivity is 131 counts per degree/second
-//   Raw value / 131.0 = angular velocity in degrees/second
+// Accelerometer: raw value - offset, divided by 16384.0 = g
+// Gyroscope: raw value - offset, divided by 131.0 = deg/s
 // ============================================================
 void readAndPrintIMU(uint8_t channel) {
-    tcaSelect(channel);     // Open the correct multiplexer channel
+    tcaSelect(channel);
 
-    // Accelerometer register map:
-    // 0x3B = ACCEL_XOUT_H (X high byte)
-    // 0x3C = ACCEL_XOUT_L (X low byte)
-    // 0x3D = ACCEL_YOUT_H
-    // 0x3E = ACCEL_YOUT_L
-    // 0x3F = ACCEL_ZOUT_H
-    // 0x40 = ACCEL_ZOUT_L
-    int16_t ax = readRawData(0x3B);
-    int16_t ay = readRawData(0x3D);
-    int16_t az = readRawData(0x3F);
+    int16_t ax_raw = readRawData(0x3B);
+    int16_t ay_raw = readRawData(0x3D);
+    int16_t az_raw = readRawData(0x3F);
+    int16_t gx_raw = readRawData(0x43);
+    int16_t gy_raw = readRawData(0x45);
+    int16_t gz_raw = readRawData(0x47);
 
-    // Gyroscope register map:
-    // 0x43 = GYRO_XOUT_H
-    // 0x44 = GYRO_XOUT_L
-    // 0x45 = GYRO_YOUT_H
-    // 0x46 = GYRO_YOUT_L
-    // 0x47 = GYRO_ZOUT_H
-    // 0x48 = GYRO_ZOUT_L
-    int16_t gx = readRawData(0x43);
-    int16_t gy = readRawData(0x45);
-    int16_t gz = readRawData(0x47);
+    // Subtract calibration offsets before converting
+    float ax_g  = (ax_raw - accelOffset[channel][0]) / 16384.0;
+    float ay_g  = (ay_raw - accelOffset[channel][1]) / 16384.0;
+    float az_g  = (az_raw - accelOffset[channel][2]) / 16384.0;
+    float gx_ds = (gx_raw - gyroOffset[channel][0])  / 131.0;
+    float gy_ds = (gy_raw - gyroOffset[channel][1])  / 131.0;
+    float gz_ds = (gz_raw - gyroOffset[channel][2])  / 131.0;
 
-    // Convert raw values to physical units
-    float ax_g  = ax / 16384.0;
-    float ay_g  = ay / 16384.0;
-    float az_g  = az / 16384.0;
-    float gx_ds = gx / 131.0;
-    float gy_ds = gy / 131.0;
-    float gz_ds = gz / 131.0;
-
-    // Print results
     Serial.print("CH"); Serial.print(channel);
     Serial.print(" | Accel (g): ");
     Serial.print(ax_g, 3); Serial.print(", ");
@@ -163,17 +253,14 @@ void readAndPrintIMU(uint8_t channel) {
 
 // ============================================================
 // FSR READ AND PRINT
-// FSRs are analog resistive sensors wired in a voltage divider
-// with a fixed resistor (10kΩ) to GND
-// ESP32 ADC reads 0-4095 (12-bit) mapping to 0-3.3V
-// Higher pressure = lower FSR resistance = higher voltage
-// = higher ADC value
+// FSRs wired in voltage divider with 10kΩ to GND
+// ESP32 ADC: 12-bit, 0-4095 maps to 0-3.3V
+// Higher pressure = lower resistance = higher voltage
 // ============================================================
 void readAndPrintFSR() {
     int heel = analogRead(FSR_HEEL_PIN);
     int fore = analogRead(FSR_FORE_PIN);
 
-    // Convert raw ADC to voltage for more meaningful output
     float heel_v = heel * (3.3 / 4095.0);
     float fore_v = fore * (3.3 / 4095.0);
 
@@ -190,9 +277,7 @@ void readAndPrintFSR() {
 
 // ============================================================
 // HAPTIC TEST
-// Simple pattern to verify vibration motor is working
-// Motor is driven by a digital GPIO pin through a transistor
-// digitalWrite HIGH activates the motor
+// 3 short pulses to verify motor wiring
 // ============================================================
 void hapticTest() {
     Serial.println("Haptic: 3 short pulses");
@@ -207,9 +292,6 @@ void hapticTest() {
 
 // ============================================================
 // SETUP
-// Runs once on boot
-// Initialises serial, I2C, and any hardware needed
-// for the selected mode
 // ============================================================
 void setup() {
     delay(1000);
@@ -217,59 +299,58 @@ void setup() {
     Serial.print("StrideSync booting | Mode: ");
     Serial.println(MODE_SELECT);
 
-    // I2C initialisation — required for all IMU modes
+    pinMode(HAPTIC_PIN, OUTPUT);    // Always init haptic pin
+                                    // used during calibration
+                                    // regardless of mode
+
     if (MODE_SELECT == 1 || MODE_SELECT == 3) {
-        pinMode(SDA_PIN, INPUT_PULLUP);     // Enable internal pull-ups
-        pinMode(SCL_PIN, INPUT_PULLUP);     // on both I2C lines
+        pinMode(SDA_PIN, INPUT_PULLUP);
+        pinMode(SCL_PIN, INPUT_PULLUP);
         Wire.begin(SDA_PIN, SCL_PIN);
-        Wire.setClock(100000);              // 100kHz standard mode
-                                            // proven stable on this hardware
-                                            // upgrade to 400kHz after all
-                                            // 3 IMUs verified working
+        Wire.setClock(100000);      // 100kHz — stable on this hardware
+                                    // upgrade to 400kHz after all IMUs verified
 
-        tcaCloseAll();                      // Close all channels on boot
-                                            // prevents IMU appearing on bus
-                                            // before channel is selected
+        tcaCloseAll();              // Close all channels on boot
 
-        // Initialise IMU on channel 0
+        // Calibrate and initialise IMU on channel 0
         tcaSelect(0);
         initIMU();
-        Serial.println("IMU on channel 0 initialised");
+        calibrateIMU(0);
+        Serial.println("IMU on channel 0 ready");
 
-        // For mode 3 initialise all 3 IMUs
         if (MODE_SELECT == 3) {
             tcaSelect(1);
             initIMU();
-            Serial.println("IMU on channel 1 initialised");
+            calibrateIMU(1);
+            Serial.println("IMU on channel 1 ready");
+
             tcaSelect(2);
             initIMU();
-            Serial.println("IMU on channel 2 initialised");
+            calibrateIMU(2);
+            Serial.println("IMU on channel 2 ready");
         }
     }
 
-    // FSR mode — analog pins need no special init on ESP32
     if (MODE_SELECT == 2) {
         Serial.println("FSR test mode — sensors on pins 32 and 33");
     }
 
-    // Haptic mode
     if (MODE_SELECT == 6) {
-        pinMode(HAPTIC_PIN, OUTPUT);
         Serial.println("Haptic test mode");
     }
 }
 
 // ============================================================
 // LOOP
-// Runs repeatedly after setup
-// Routes to the correct test based on MODE_SELECT
 // ============================================================
 void loop() {
     switch (MODE_SELECT) {
 
         // ----------------------------------------
         // MODE 1: Single IMU on channel 0
-        // Expected: Z accel ~1.0g flat, gyro ~0 stationary
+        // Expected after calibration:
+        // Z accel = ~1.0g, X/Y accel = ~0.0g
+        // All gyro axes = ~0.0 deg/s stationary
         // ----------------------------------------
         case 1:
             readAndPrintIMU(0);
@@ -278,8 +359,7 @@ void loop() {
 
         // ----------------------------------------
         // MODE 2: FSR test
-        // Press heel and forefoot sensors
-        // Expected: values rise with pressure
+        // Press sensors, values should rise
         // ----------------------------------------
         case 2:
             readAndPrintFSR();
@@ -287,9 +367,9 @@ void loop() {
             break;
 
         // ----------------------------------------
-        // MODE 3: All 3 IMUs via multiplexer
-        // Wire IMUs to channels 0, 1, 2
-        // Expected: all 3 showing independent data
+        // MODE 3: All 3 IMUs
+        // Wire to channels 0, 1, 2
+        // Each calibrated independently on boot
         // ----------------------------------------
         case 3:
             readAndPrintIMU(0);
@@ -299,9 +379,6 @@ void loop() {
             delay(100);
             break;
 
-        // ----------------------------------------
-        // MODE 4-9: Placeholders for future modes
-        // ----------------------------------------
         case 4:
             Serial.println("Mode 4 (WiFi) not yet implemented");
             delay(1000);
