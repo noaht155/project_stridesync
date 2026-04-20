@@ -14,7 +14,7 @@
 // 8 = Bilateral synchronisation
 // 9 = Full functionality
 // ============================================================
-#define MODE_SELECT 1
+#define MODE_SELECT 3
 
 // ============================================================
 // HARDWARE CONSTANTS
