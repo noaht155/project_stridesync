@@ -325,8 +325,8 @@ void setup() {
 
     // I2C init required for any IMU mode
     if (MODE_SELECT == 1 || MODE_SELECT == 3 || MODE_SELECT == 9) {
-        pinMode(SDA_PIN, INPUT_PULLUP);
-        pinMode(SCL_PIN, INPUT_PULLUP);
+        pinMode(SDA_PIN, INPUT);
+        pinMode(SCL_PIN, INPUT);
         Wire.begin(SDA_PIN, SCL_PIN);
         Wire.setClock(100000);
 
