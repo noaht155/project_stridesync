@@ -1,39 +1,52 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
 
 // ============================================================
 // MODE SELECT
-// 1 = IMU auto-detect and test
-// 2 = FSR test
-// 3 = All detected IMUs streaming
-// 4 = WiFi streaming
-// 5 = SD card logging
-// 6 = Haptic feedback test
-// 7 = Gait event detection
-// 8 = Bilateral synchronisation
-// 9 = Full functionality
+// 1  = All detected IMUs — labelled output
+// 2  = FSR test
+// 3  = Mahony filter — orientation angles
+// 4  = WiFi streaming
+// 5  = SD card logging
+// 6  = Haptic feedback test
+// 7  = Gait event detection
+// 8  = Bilateral synchronisation
+// 9  = Full functionality
+// 10 = Raw plotter mode (comma separated, single IMU)
 // ============================================================
 #define MODE_SELECT 3
 
 // ============================================================
 // HARDWARE CONSTANTS
 // ============================================================
-#define TCA_ADDRESS  0x70
-#define MPU_ADDRESS  0x68
-#define SDA_PIN      21
-#define SCL_PIN      22
-#define FSR_HEEL_PIN 32
-#define FSR_FORE_PIN 33
-#define HAPTIC_PIN   25
+#define TCA_ADDRESS   0x70
+#define MPU_ADDRESS   0x68
+#define SDA_PIN       21
+#define SCL_PIN       22
+#define FSR_HEEL_PIN  32
+#define FSR_FORE_PIN  33
+#define HAPTIC_PIN    25
 #define CALIB_SAMPLES 1000
 
 // ============================================================
-// IMU CHANNEL MAPPING
-// Physical meaning of each multiplexer channel
-// Channels 0-2: Left leg (foot, shank, thigh)
-// Channels 3-5: Right leg (foot, shank, thigh)
-// Channels 6-7: Unused
-// Update these labels to match your physical wiring
+// MAHONY FILTER CONSTANTS
+// Kp — proportional gain
+//   Controls how strongly accelerometer corrects gyro drift
+//   Higher = faster correction but more sensitive to vibration
+//   Lower  = smoother but slower to correct drift
+//   0.5 is a good starting point for walking/running
+// Ki — integral gain
+//   Corrects slowly accumulating gyro bias over time
+//   0.0 disables integral correction — start here
+//   Enable (0.01-0.1) if drift persists after calibration
+// ============================================================
+#define Kp 0.5f
+#define Ki 0.0f
+
+// ============================================================
+// CHANNEL LABELS
+// Update to match your physical wiring
 // ============================================================
 const char* CHANNEL_LABELS[] = {
     "L-Foot",   // Channel 0
@@ -47,15 +60,24 @@ const char* CHANNEL_LABELS[] = {
 };
 
 // ============================================================
-// IMU STATE TRACKING
-// imuConnected[] — true if IMU detected on that channel
-// imuCount — total number of detected IMUs
-// accelOffset / gyroOffset — calibration offsets per channel
+// IMU STATE
 // ============================================================
-bool  imuConnected[8]    = {false};
-uint8_t imuCount         = 0;
-float accelOffset[8][3]  = {{0}};
-float gyroOffset[8][3]   = {{0}};
+bool    imuConnected[8]   = {false};
+uint8_t imuCount          = 0;
+float   accelOffset[8][3] = {{0}};
+float   gyroOffset[8][3]  = {{0}};
+
+// ============================================================
+// MAHONY FILTER STATE
+// One quaternion per IMU channel — represents orientation
+// Quaternion components: q0=w, q1=x, q2=y, q3=z
+// Initialised to identity quaternion (no rotation)
+// integralFB — integral feedback term for Ki correction
+// lastTime — timestamp of last update per channel in microseconds
+// ============================================================
+float q0[8], q1[8], q2[8], q3[8];
+float integralFBx[8], integralFBy[8], integralFBz[8];
+unsigned long lastTime[8];
 
 // ============================================================
 // MULTIPLEXER FUNCTIONS
@@ -96,10 +118,6 @@ void initIMU() {
 
 // ============================================================
 // IMU DETECTION
-// Attempts to communicate with MPU at 0x68 on each channel
-// A successful transmission with error code 0 means IMU present
-// Populates imuConnected[] and imuCount
-// Prints a summary of what was found and where
 // ============================================================
 void detectIMUs() {
     Serial.println("--- Scanning for IMUs ---");
@@ -123,7 +141,6 @@ void detectIMUs() {
     }
 
     tcaCloseAll();
-
     Serial.print("Total IMUs detected: ");
     Serial.println(imuCount);
 
@@ -135,33 +152,26 @@ void detectIMUs() {
     } else {
         Serial.println("All 6 IMUs detected");
     }
-
     Serial.println("-------------------------");
 }
 
 // ============================================================
 // IMU CALIBRATION
-// Calibrates only detected IMUs — skips empty channels
-// Places haptic feedback at start, during, and end
-// Averages CALIB_SAMPLES readings per IMU
-// Subtracts 16384 from accel Z offset (expected 1g)
 // ============================================================
 void calibrateIMU(uint8_t channel) {
-    if (!imuConnected[channel]) return;     // Skip if no IMU on this channel
+    if (!imuConnected[channel]) return;
 
     tcaSelect(channel);
-
     Serial.print("Calibrating ");
     Serial.print(CHANNEL_LABELS[channel]);
     Serial.println(" — hold still...");
 
-    // 3 short buzzes: calibration starting
     for (int i = 0; i < 3; i++) {
         digitalWrite(HAPTIC_PIN, HIGH); delay(100);
         digitalWrite(HAPTIC_PIN, LOW);  delay(100);
     }
 
-    delay(2000);    // Time to place IMU flat and still
+    delay(2000);
 
     long ax_sum = 0, ay_sum = 0, az_sum = 0;
     long gx_sum = 0, gy_sum = 0, gz_sum = 0;
@@ -175,16 +185,13 @@ void calibrateIMU(uint8_t channel) {
         gy_sum += readRawData(0x45);
         gz_sum += readRawData(0x47);
 
-        // Haptic pulse every 200 samples — 5 pulses total
         if (i % 200 == 0) {
             digitalWrite(HAPTIC_PIN, HIGH); delay(30);
             digitalWrite(HAPTIC_PIN, LOW);
         }
-
         delay(5);
     }
 
-    // Store offsets
     accelOffset[channel][0] = (float)ax_sum / CALIB_SAMPLES;
     accelOffset[channel][1] = (float)ay_sum / CALIB_SAMPLES;
     accelOffset[channel][2] = (float)az_sum / CALIB_SAMPLES - 16384.0;
@@ -192,7 +199,6 @@ void calibrateIMU(uint8_t channel) {
     gyroOffset[channel][1]  = (float)gy_sum / CALIB_SAMPLES;
     gyroOffset[channel][2]  = (float)gz_sum / CALIB_SAMPLES;
 
-    // Print offsets for verification
     Serial.print(CHANNEL_LABELS[channel]);
     Serial.print(" Accel offsets: ");
     Serial.print(accelOffset[channel][0], 1); Serial.print(", ");
@@ -205,7 +211,6 @@ void calibrateIMU(uint8_t channel) {
     Serial.print(gyroOffset[channel][1], 1); Serial.print(", ");
     Serial.println(gyroOffset[channel][2], 1);
 
-    // 2 long buzzes: calibration complete
     digitalWrite(HAPTIC_PIN, HIGH); delay(300);
     digitalWrite(HAPTIC_PIN, LOW);  delay(150);
     digitalWrite(HAPTIC_PIN, HIGH); delay(300);
@@ -216,11 +221,6 @@ void calibrateIMU(uint8_t channel) {
     Serial.println();
 }
 
-// ============================================================
-// CALIBRATE ALL DETECTED IMUs
-// Iterates through all 8 channels
-// Skips channels with no IMU detected
-// ============================================================
 void calibrateAll() {
     Serial.println("--- Beginning calibration ---");
     Serial.println("Place all IMUs flat and still");
@@ -231,14 +231,209 @@ void calibrateAll() {
             calibrateIMU(ch);
         }
     }
-
     Serial.println("--- All calibrations complete ---");
 }
 
 // ============================================================
-// READ AND PRINT ONE IMU
-// Subtracts calibration offsets before converting
-// Skips if no IMU on this channel
+// MAHONY FILTER INITIALISATION
+// Sets each quaternion to identity — no rotation
+// Clears integral feedback terms
+// Records current time for first dt calculation
+// Must be called after calibration, before filter runs
+// ============================================================
+void initMahony() {
+    for (uint8_t ch = 0; ch < 8; ch++) {
+        q0[ch] = 1.0f;     // w component — 1.0 = no rotation
+        q1[ch] = 0.0f;     // x component
+        q2[ch] = 0.0f;     // y component
+        q3[ch] = 0.0f;     // z component
+        integralFBx[ch] = 0.0f;
+        integralFBy[ch] = 0.0f;
+        integralFBz[ch] = 0.0f;
+        lastTime[ch] = micros();
+    }
+    Serial.println("Mahony filter initialised");
+}
+
+// ============================================================
+// MAHONY FILTER UPDATE
+// Called once per sample per IMU
+// Takes calibrated accelerometer (g) and gyroscope (rad/s)
+// Updates quaternion for that channel
+//
+// Steps:
+// 1. Normalise accelerometer vector — removes magnitude,
+//    keeps direction which is all we need for gravity reference
+// 2. Estimate gravity direction from current quaternion
+// 3. Cross product of estimated vs measured gravity = error
+// 4. Apply proportional (Kp) correction to gyro rates
+// 5. Apply integral (Ki) correction if enabled
+// 6. Integrate corrected gyro rates to update quaternion
+// 7. Normalise quaternion — prevents numerical drift
+//
+// Note: gyro input must be in radians/second not degrees/second
+// ============================================================
+void mahonyUpdate(uint8_t ch,
+                  float ax, float ay, float az,
+                  float gx, float gy, float gz) {
+
+    // Calculate dt in seconds since last update for this channel
+    unsigned long now = micros();
+    float dt = (now - lastTime[ch]) / 1000000.0f;
+    lastTime[ch] = now;
+
+    // Guard against bad dt — first call or timer overflow
+    if (dt <= 0.0f || dt > 1.0f) dt = 0.01f;
+
+    // Step 1: Normalise accelerometer
+    // If accelerometer reads all zero something is wrong — skip
+    float norm = sqrtf(ax*ax + ay*ay + az*az);
+    if (norm == 0.0f) return;
+    norm = 1.0f / norm;
+    ax *= norm;
+    ay *= norm;
+    az *= norm;
+
+    // Step 2: Estimated gravity direction from current quaternion
+    // These equations derive the gravity vector from the quaternion
+    // by rotating the reference gravity vector [0, 0, 1] by the
+    // inverse of the current orientation
+    float vx = 2.0f * (q1[ch]*q3[ch] - q0[ch]*q2[ch]);
+    float vy = 2.0f * (q0[ch]*q1[ch] + q2[ch]*q3[ch]);
+    float vz = q0[ch]*q0[ch] - q1[ch]*q1[ch] - q2[ch]*q2[ch] + q3[ch]*q3[ch];
+
+    // Step 3: Cross product of estimated vs measured gravity
+    // This gives us the rotation error between where we think
+    // gravity points and where the accelerometer says it points
+    float ex = ay*vz - az*vy;
+    float ey = az*vx - ax*vz;
+    float ez = ax*vy - ay*vx;
+
+    // Step 4: Integral feedback (Ki)
+    // Accumulates error over time to correct slow drift
+    // Disabled by default (Ki = 0.0)
+    if (Ki > 0.0f) {
+        integralFBx[ch] += Ki * ex * dt;
+        integralFBy[ch] += Ki * ey * dt;
+        integralFBz[ch] += Ki * ez * dt;
+        gx += integralFBx[ch];
+        gy += integralFBy[ch];
+        gz += integralFBz[ch];
+    }
+
+    // Step 5: Proportional feedback (Kp)
+    // Directly corrects gyro rates based on current error
+    gx += Kp * ex;
+    gy += Kp * ey;
+    gz += Kp * ez;
+
+    // Step 6: Integrate corrected gyro to update quaternion
+    // This is the first order quaternion integration formula
+    // Multiply by dt/2 — quaternion derivative = 0.5 * q * omega
+    float qa = q0[ch], qb = q1[ch], qc = q2[ch];
+    q0[ch] += (-qb*gx - qc*gy - q3[ch]*gz) * (0.5f * dt);
+    q1[ch] += ( qa*gx + qc*gz - q3[ch]*gy) * (0.5f * dt);
+    q2[ch] += ( qa*gy - qb*gz + q3[ch]*gx) * (0.5f * dt);
+    q3[ch] += ( qa*gz + qb*gy - qc*gx)     * (0.5f * dt);
+
+    // Step 7: Normalise quaternion
+    // Prevents numerical errors accumulating over time
+    norm = sqrtf(q0[ch]*q0[ch] + q1[ch]*q1[ch] +
+                 q2[ch]*q2[ch] + q3[ch]*q3[ch]);
+    norm = 1.0f / norm;
+    q0[ch] *= norm;
+    q1[ch] *= norm;
+    q2[ch] *= norm;
+    q3[ch] *= norm;
+}
+
+// ============================================================
+// QUATERNION TO EULER ANGLES
+// Converts quaternion to roll, pitch, yaw in degrees
+// Roll  = rotation around X axis (side to side tilt)
+// Pitch = rotation around Y axis (forward/back tilt)
+// Yaw   = rotation around Z axis (compass heading)
+//
+// Note: yaw will drift over time without a magnetometer
+// For gait analysis roll and pitch are the useful angles
+// as they capture joint flexion and lateral lean
+// ============================================================
+void quaternionToEuler(uint8_t ch,
+                       float &roll, float &pitch, float &yaw) {
+    roll  = atan2f(2.0f*(q0[ch]*q1[ch] + q2[ch]*q3[ch]),
+                   1.0f - 2.0f*(q1[ch]*q1[ch] + q2[ch]*q2[ch]));
+    pitch = asinf( 2.0f*(q0[ch]*q2[ch] - q3[ch]*q1[ch]));
+    yaw   = atan2f(2.0f*(q0[ch]*q3[ch] + q1[ch]*q2[ch]),
+                   1.0f - 2.0f*(q2[ch]*q2[ch] + q3[ch]*q3[ch]));
+
+    // Convert radians to degrees
+    roll  *= 180.0f / M_PI;
+    pitch *= 180.0f / M_PI;
+    yaw   *= 180.0f / M_PI;
+}
+
+// ============================================================
+// READ IMU AND UPDATE MAHONY FILTER
+// Reads raw data, applies calibration offsets,
+// converts gyro to radians/second for filter input,
+// updates Mahony filter, converts result to Euler angles,
+// prints angles to serial
+// ============================================================
+void updateAndPrintIMU(uint8_t channel) {
+    if (!imuConnected[channel]) return;
+
+    tcaSelect(channel);
+
+    int16_t ax_raw = readRawData(0x3B);
+    int16_t ay_raw = readRawData(0x3D);
+    int16_t az_raw = readRawData(0x3F);
+    int16_t gx_raw = readRawData(0x43);
+    int16_t gy_raw = readRawData(0x45);
+    int16_t gz_raw = readRawData(0x47);
+
+    // Apply calibration offsets and convert to physical units
+    float ax = (ax_raw - accelOffset[channel][0]) / 16384.0f;
+    float ay = (ay_raw - accelOffset[channel][1]) / 16384.0f;
+    float az = (az_raw - accelOffset[channel][2]) / 16384.0f;
+
+    // Gyro must be in radians/second for Mahony filter
+    // Divide by 131.0 for deg/s then multiply by pi/180 for rad/s
+    float gx = (gx_raw - gyroOffset[channel][0]) / 131.0f * (M_PI / 180.0f);
+    float gy = (gy_raw - gyroOffset[channel][1]) / 131.0f * (M_PI / 180.0f);
+    float gz = (gz_raw - gyroOffset[channel][2]) / 131.0f * (M_PI / 180.0f);
+
+    // Update filter
+    mahonyUpdate(channel, ax, ay, az, gx, gy, gz);
+
+    // Get Euler angles
+    float roll, pitch, yaw;
+    quaternionToEuler(channel, roll, pitch, yaw);
+
+    // Print
+    Serial.print(CHANNEL_LABELS[channel]);
+    Serial.print(" | Roll: ");
+    Serial.print(roll, 1);
+    Serial.print("° | Pitch: ");
+    Serial.print(pitch, 1);
+    Serial.print("° | Yaw: ");
+    Serial.print(yaw, 1);
+    Serial.println("°");
+}
+
+// ============================================================
+// UPDATE ALL DETECTED IMUs
+// ============================================================
+void updateAllIMUs() {
+    for (uint8_t ch = 0; ch < 8; ch++) {
+        if (imuConnected[ch]) {
+            updateAndPrintIMU(ch);
+        }
+    }
+    Serial.println("---");
+}
+
+// ============================================================
+// RAW READ AND PRINT — for mode 1 and plotter
 // ============================================================
 void readAndPrintIMU(uint8_t channel) {
     if (!imuConnected[channel]) return;
@@ -252,12 +447,12 @@ void readAndPrintIMU(uint8_t channel) {
     int16_t gy_raw = readRawData(0x45);
     int16_t gz_raw = readRawData(0x47);
 
-    float ax_g  = (ax_raw - accelOffset[channel][0]) / 16384.0;
-    float ay_g  = (ay_raw - accelOffset[channel][1]) / 16384.0;
-    float az_g  = (az_raw - accelOffset[channel][2]) / 16384.0;
-    float gx_ds = (gx_raw - gyroOffset[channel][0])  / 131.0;
-    float gy_ds = (gy_raw - gyroOffset[channel][1])  / 131.0;
-    float gz_ds = (gz_raw - gyroOffset[channel][2])  / 131.0;
+    float ax_g  = (ax_raw - accelOffset[channel][0]) / 16384.0f;
+    float ay_g  = (ay_raw - accelOffset[channel][1]) / 16384.0f;
+    float az_g  = (az_raw - accelOffset[channel][2]) / 16384.0f;
+    float gx_ds = (gx_raw - gyroOffset[channel][0])  / 131.0f;
+    float gy_ds = (gy_raw - gyroOffset[channel][1])  / 131.0f;
+    float gz_ds = (gz_raw - gyroOffset[channel][2])  / 131.0f;
 
     Serial.print(CHANNEL_LABELS[channel]);
     Serial.print(" | Accel (g): ");
@@ -270,9 +465,6 @@ void readAndPrintIMU(uint8_t channel) {
     Serial.println(gz_ds, 3);
 }
 
-// ============================================================
-// READ ALL DETECTED IMUs
-// ============================================================
 void readAllIMUs() {
     for (uint8_t ch = 0; ch < 8; ch++) {
         if (imuConnected[ch]) {
@@ -288,15 +480,11 @@ void readAllIMUs() {
 void readAndPrintFSR() {
     int heel = analogRead(FSR_HEEL_PIN);
     int fore = analogRead(FSR_FORE_PIN);
-
-    float heel_v = heel * (3.3 / 4095.0);
-    float fore_v = fore * (3.3 / 4095.0);
-
-    Serial.print("FSR Heel: ");
-    Serial.print(heel);
+    float heel_v = heel * (3.3f / 4095.0f);
+    float fore_v = fore * (3.3f / 4095.0f);
+    Serial.print("FSR Heel: "); Serial.print(heel);
     Serial.print(" ("); Serial.print(heel_v, 2); Serial.print("V)");
-    Serial.print(" | FSR Fore: ");
-    Serial.print(fore);
+    Serial.print(" | FSR Fore: "); Serial.print(fore);
     Serial.print(" ("); Serial.print(fore_v, 2); Serial.println("V)");
 }
 
@@ -323,19 +511,15 @@ void setup() {
 
     pinMode(HAPTIC_PIN, OUTPUT);
 
-    // I2C init required for any IMU mode
-    if (MODE_SELECT == 1 || MODE_SELECT == 3 || MODE_SELECT == 9) {
+    if (MODE_SELECT == 1 || MODE_SELECT == 3 ||
+        MODE_SELECT == 9 || MODE_SELECT == 10) {
         pinMode(SDA_PIN, INPUT);
         pinMode(SCL_PIN, INPUT);
         Wire.begin(SDA_PIN, SCL_PIN);
         Wire.setClock(100000);
-
         tcaCloseAll();
-
-        // Detect which channels have IMUs
         detectIMUs();
 
-        // Initialise all detected IMUs
         for (uint8_t ch = 0; ch < 8; ch++) {
             if (imuConnected[ch]) {
                 tcaSelect(ch);
@@ -343,13 +527,16 @@ void setup() {
             }
         }
         tcaCloseAll();
-
-        // Calibrate all detected IMUs
         calibrateAll();
     }
 
+    // Mahony mode needs I2C and filter init
+    if (MODE_SELECT == 3) {
+        initMahony();
+    }
+
     if (MODE_SELECT == 2) {
-        Serial.println("FSR test mode — sensors on pins 32 and 33");
+        Serial.println("FSR test mode");
     }
 
     if (MODE_SELECT == 6) {
@@ -364,9 +551,7 @@ void loop() {
     switch (MODE_SELECT) {
 
         // ----------------------------------------
-        // MODE 1: Auto-detect and stream all IMUs
-        // Detects however many are connected
-        // Labels each by anatomical position
+        // MODE 1: Raw IMU data — all detected IMUs
         // ----------------------------------------
         case 1:
             readAllIMUs();
@@ -382,12 +567,15 @@ void loop() {
             break;
 
         // ----------------------------------------
-        // MODE 3: All detected IMUs — same as mode 1
-        // Kept separate for future mode 1 single IMU use
+        // MODE 3: Mahony filter — orientation angles
+        // Expected when flat and still:
+        //   Roll ~0°, Pitch ~0°, Yaw ~0°
+        // Rotate IMU and watch angles track movement
+        // Yaw will drift without magnetometer — normal
         // ----------------------------------------
         case 3:
-            readAllIMUs();
-            delay(100);
+            updateAllIMUs();
+            delay(10);      // 100Hz update rate
             break;
 
         case 4:
@@ -417,6 +605,37 @@ void loop() {
         case 9:
             Serial.println("Mode 9 (Full) not yet implemented");
             delay(1000);
+            break;
+
+        // ----------------------------------------
+        // MODE 10: Plotter mode
+        // Comma separated output for Python visualiser
+        // Prints single IMU on channel 0 only
+        // Change channel number to inspect others
+        // ----------------------------------------
+        case 10:
+            if (imuConnected[0]) {
+                tcaSelect(0);
+                int16_t ax_raw = readRawData(0x3B);
+                int16_t ay_raw = readRawData(0x3D);
+                int16_t az_raw = readRawData(0x3F);
+                int16_t gx_raw = readRawData(0x43);
+                int16_t gy_raw = readRawData(0x45);
+                int16_t gz_raw = readRawData(0x47);
+                float ax = (ax_raw - accelOffset[0][0]) / 16384.0f;
+                float ay = (ay_raw - accelOffset[0][1]) / 16384.0f;
+                float az = (az_raw - accelOffset[0][2]) / 16384.0f;
+                float gx = (gx_raw - gyroOffset[0][0]) / 131.0f;
+                float gy = (gy_raw - gyroOffset[0][1]) / 131.0f;
+                float gz = (gz_raw - gyroOffset[0][2]) / 131.0f;
+                Serial.print(ax, 3); Serial.print(",");
+                Serial.print(ay, 3); Serial.print(",");
+                Serial.print(az, 3); Serial.print(",");
+                Serial.print(gx, 3); Serial.print(",");
+                Serial.print(gy, 3); Serial.print(",");
+                Serial.println(gz, 3);
+            }
+            delay(10);
             break;
 
         default:
