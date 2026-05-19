@@ -7,15 +7,30 @@
 // 1  = All detected IMUs — labelled output
 // 2  = FSR test
 // 3  = Mahony filter — orientation angles
-// 4  = WiFi streaming
-// 5  = SD card logging
+// 4  = WiFi streaming (planned)
+// 5  = SD card binary logging
 // 6  = Haptic feedback test
-// 7  = Gait event detection
-// 8  = Bilateral synchronisation
-// 9  = Full functionality
+// 7  = Gait event detection (planned)
+// 8  = Bilateral synchronisation (planned)
+// 9  = Full functionality (planned)
 // 10 = Raw plotter mode (comma separated, single IMU)
+// 11 = WiFi file server — serve SD logs for download
 // ============================================================
 #define MODE_SELECT 3
+
+// ============================================================
+// MODE 5 / MODE 11 DEPENDENCIES
+// Only compiled when SD or WiFi modes are selected
+// ============================================================
+#if MODE_SELECT == 5 || MODE_SELECT == 11
+#include <SPI.h>
+#include <SD.h>
+#endif
+
+#if MODE_SELECT == 11
+#include <WiFi.h>
+#include <WebServer.h>
+#endif
 
 // ============================================================
 // HARDWARE CONSTANTS
@@ -24,10 +39,50 @@
 #define MPU_ADDRESS   0x68
 #define SDA_PIN       21
 #define SCL_PIN       22
-#define FSR_HEEL_PIN  32
-#define FSR_FORE_PIN  33
+#define FSR_HEEL_L    32    // Left heel  (ADC1)
+#define FSR_FORE_L    33    // Left fore  (ADC1)
+#define FSR_HEEL_R    34    // Right heel (ADC1)
+#define FSR_FORE_R    35    // Right fore (ADC1)
 #define HAPTIC_PIN    25
 #define CALIB_SAMPLES 1000
+
+// SD card SPI — standard ESP32 VSPI pins
+#define SD_CS         5
+#define SD_MOSI       23
+#define SD_MISO       19
+#define SD_CLK        18
+
+// WiFi credentials — fill in before using Mode 11
+#define WIFI_SSID     "YOUR_SSID"
+#define WIFI_PASS     "YOUR_PASSWORD"
+
+// Binary log record: 70 bytes
+// Matches Dashboard/data_loader.py _BINARY_FMT = '<QB13f4HB'
+#pragma pack(push, 1)
+struct LogRecord {
+    uint64_t timestamp_us;
+    uint8_t  channel;
+    float    qw, qx, qy, qz;
+    float    roll, pitch, yaw;
+    float    ax, ay, az;          // calibrated, g units
+    float    gx, gy, gz;          // calibrated, deg/s
+    uint16_t fsr_heel_left;
+    uint16_t fsr_fore_left;
+    uint16_t fsr_heel_right;
+    uint16_t fsr_fore_right;
+    uint8_t  gait_phase;
+};
+#pragma pack(pop)
+
+#if MODE_SELECT == 5 || MODE_SELECT == 11
+File     logFile;
+char     logFilename[32];
+bool     sdReady = false;
+#endif
+
+#if MODE_SELECT == 11
+WebServer httpServer(80);
+#endif
 
 // ============================================================
 // MAHONY FILTER CONSTANTS
@@ -501,6 +556,181 @@ void hapticTest() {
 }
 
 // ============================================================
+// FSR READ (all 4 sensors)
+// ============================================================
+void readFSRs(uint16_t &hl, uint16_t &fl, uint16_t &hr, uint16_t &fr) {
+    hl = (uint16_t)analogRead(FSR_HEEL_L);
+    fl = (uint16_t)analogRead(FSR_FORE_L);
+    hr = (uint16_t)analogRead(FSR_HEEL_R);
+    fr = (uint16_t)analogRead(FSR_FORE_R);
+}
+
+// ============================================================
+// MODE 5 — SD CARD BINARY LOGGING
+// Writes one LogRecord per IMU per sample tick.
+// Binary format matches Dashboard/data_loader.py _BINARY_FMT.
+// ============================================================
+#if MODE_SELECT == 5 || MODE_SELECT == 11
+
+bool initSD() {
+    SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+    if (!SD.begin(SD_CS)) {
+        Serial.println("SD init failed — check wiring");
+        return false;
+    }
+    Serial.println("SD card ready");
+    return true;
+}
+
+// Generate a unique filename: run_001.bin, run_002.bin, ...
+void openNewLogFile() {
+    for (int i = 1; i <= 999; i++) {
+        snprintf(logFilename, sizeof(logFilename), "/run_%03d.bin", i);
+        if (!SD.exists(logFilename)) {
+            logFile = SD.open(logFilename, FILE_WRITE);
+            if (logFile) {
+                Serial.print("Logging to: ");
+                Serial.println(logFilename);
+            } else {
+                Serial.println("Failed to open log file");
+            }
+            return;
+        }
+    }
+    Serial.println("No free filename — delete old logs");
+}
+
+void writeLogRecord(uint8_t channel,
+                    float qw_, float qx_, float qy_, float qz_,
+                    float roll_, float pitch_, float yaw_,
+                    float ax_, float ay_, float az_,
+                    float gx_, float gy_, float gz_,
+                    uint16_t fhl, uint16_t ffl, uint16_t fhr, uint16_t ffr,
+                    uint8_t phase) {
+    if (!sdReady || !logFile) return;
+    LogRecord rec;
+    rec.timestamp_us   = (uint64_t)micros();
+    rec.channel        = channel;
+    rec.qw = qw_; rec.qx = qx_; rec.qy = qy_; rec.qz = qz_;
+    rec.roll = roll_; rec.pitch = pitch_; rec.yaw = yaw_;
+    rec.ax = ax_; rec.ay = ay_; rec.az = az_;
+    rec.gx = gx_; rec.gy = gy_; rec.gz = gz_;
+    rec.fsr_heel_left  = fhl;
+    rec.fsr_fore_left  = ffl;
+    rec.fsr_heel_right = fhr;
+    rec.fsr_fore_right = ffr;
+    rec.gait_phase     = phase;
+    logFile.write((uint8_t*)&rec, sizeof(LogRecord));
+}
+
+// Call periodically to flush OS write buffer to card
+void flushLog() {
+    if (logFile) logFile.flush();
+}
+
+#endif  // MODE_SELECT == 5 || 11
+
+// ============================================================
+// MODE 11 — WiFi HTTP FILE SERVER
+// Serves SD card log files over HTTP so the Python
+// fetch_log.py script can download and convert them.
+//
+// Endpoints:
+//   GET /files              — JSON list of .bin files
+//   GET /download?name=x    — stream file to client
+//   GET /delete?name=x      — delete file from SD
+// ============================================================
+#if MODE_SELECT == 11
+
+bool connectWiFi() {
+    Serial.print("Connecting to ");
+    Serial.println(WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi connection failed");
+        return false;
+    }
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+}
+
+void handleListFiles() {
+    String json = "{\"files\":[";
+    File root = SD.open("/");
+    bool first = true;
+    while (true) {
+        File entry = root.openNextFile();
+        if (!entry) break;
+        String name = String(entry.name());
+        if (name.endsWith(".bin")) {
+            if (!first) json += ",";
+            json += "\"" + name + "\"";
+            first = false;
+        }
+        entry.close();
+    }
+    root.close();
+    json += "]}";
+    httpServer.send(200, "application/json", json);
+}
+
+void handleDownload() {
+    if (!httpServer.hasArg("name")) {
+        httpServer.send(400, "text/plain", "Missing ?name=");
+        return;
+    }
+    String filename = "/" + httpServer.arg("name");
+    if (!SD.exists(filename)) {
+        httpServer.send(404, "text/plain", "Not found: " + filename);
+        return;
+    }
+    // Haptic: motor on during transfer
+    digitalWrite(HAPTIC_PIN, HIGH);
+    File file = SD.open(filename, FILE_READ);
+    httpServer.streamFile(file, "application/octet-stream");
+    file.close();
+    digitalWrite(HAPTIC_PIN, LOW);
+    // 5 short pulses: transfer complete
+    for (int i = 0; i < 5; i++) {
+        digitalWrite(HAPTIC_PIN, HIGH); delay(60);
+        digitalWrite(HAPTIC_PIN, LOW);  delay(80);
+    }
+    Serial.print("Sent: "); Serial.println(filename);
+}
+
+void handleDelete() {
+    if (!httpServer.hasArg("name")) {
+        httpServer.send(400, "text/plain", "Missing ?name=");
+        return;
+    }
+    String filename = "/" + httpServer.arg("name");
+    if (SD.remove(filename)) {
+        httpServer.send(200, "text/plain", "Deleted: " + filename);
+        Serial.print("Deleted: "); Serial.println(filename);
+    } else {
+        httpServer.send(500, "text/plain", "Delete failed");
+    }
+}
+
+void handleRoot() {
+    httpServer.send(200, "text/plain",
+        "StrideSync file server running.\n"
+        "  GET /files              — list .bin logs\n"
+        "  GET /download?name=x   — download file\n"
+        "  GET /delete?name=x     — delete file\n");
+}
+
+#endif  // MODE_SELECT == 11
+
+// ============================================================
 // SETUP
 // ============================================================
 void setup() {
@@ -542,6 +772,39 @@ void setup() {
     if (MODE_SELECT == 6) {
         Serial.println("Haptic test mode");
     }
+
+#if MODE_SELECT == 5
+    // SD card binary logging
+    sdReady = initSD();
+    if (sdReady) {
+        openNewLogFile();
+        // 3 short pulses: logging ready
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(HAPTIC_PIN, HIGH); delay(80);
+            digitalWrite(HAPTIC_PIN, LOW);  delay(120);
+        }
+    }
+#endif
+
+#if MODE_SELECT == 11
+    // WiFi file server
+    sdReady = initSD();
+    if (sdReady && connectWiFi()) {
+        httpServer.on("/",        handleRoot);
+        httpServer.on("/files",   handleListFiles);
+        httpServer.on("/download", HTTP_GET, handleDownload);
+        httpServer.on("/delete",   HTTP_GET, handleDelete);
+        httpServer.begin();
+        Serial.println("HTTP server started");
+        Serial.printf("  http://%s/files\n", WiFi.localIP().toString().c_str());
+        Serial.printf("  http://%s/download?name=run_001.bin\n", WiFi.localIP().toString().c_str());
+        // 3 short pulses: server ready
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(HAPTIC_PIN, HIGH); delay(80);
+            digitalWrite(HAPTIC_PIN, LOW);  delay(120);
+        }
+    }
+#endif
 }
 
 // ============================================================
@@ -579,13 +842,67 @@ void loop() {
             break;
 
         case 4:
-            Serial.println("Mode 4 (WiFi) not yet implemented");
+            Serial.println("Mode 4 (WiFi streaming) not yet implemented");
             delay(1000);
             break;
 
+        // ----------------------------------------
+        // MODE 5: SD card binary logging at 200Hz
+        // Binary format matches Dashboard data_loader.py
+        // Switch to Mode 11 after run to download
+        // ----------------------------------------
         case 5:
-            Serial.println("Mode 5 (SD card) not yet implemented");
-            delay(1000);
+#if MODE_SELECT == 5
+        {
+            if (!sdReady) { delay(1000); break; }
+
+            static uint32_t lastFlush = 0;
+            uint16_t fhl, ffl, fhr, ffr;
+            readFSRs(fhl, ffl, fhr, ffr);
+
+            for (uint8_t ch = 0; ch < 8; ch++) {
+                if (!imuConnected[ch]) continue;
+                tcaSelect(ch);
+
+                int16_t ax_r = readRawData(0x3B);
+                int16_t ay_r = readRawData(0x3D);
+                int16_t az_r = readRawData(0x3F);
+                int16_t gx_r = readRawData(0x43);
+                int16_t gy_r = readRawData(0x45);
+                int16_t gz_r = readRawData(0x47);
+
+                float ax = (ax_r - accelOffset[ch][0]) / 16384.0f;
+                float ay = (ay_r - accelOffset[ch][1]) / 16384.0f;
+                float az = (az_r - accelOffset[ch][2]) / 16384.0f;
+                float gx_rads = (gx_r - gyroOffset[ch][0]) / 131.0f * (M_PI / 180.0f);
+                float gy_rads = (gy_r - gyroOffset[ch][1]) / 131.0f * (M_PI / 180.0f);
+                float gz_rads = (gz_r - gyroOffset[ch][2]) / 131.0f * (M_PI / 180.0f);
+                float gx_degs = (gx_r - gyroOffset[ch][0]) / 131.0f;
+                float gy_degs = (gy_r - gyroOffset[ch][1]) / 131.0f;
+                float gz_degs = (gz_r - gyroOffset[ch][2]) / 131.0f;
+
+                mahonyUpdate(ch, ax, ay, az, gx_rads, gy_rads, gz_rads);
+
+                float roll, pitch, yaw;
+                quaternionToEuler(ch, roll, pitch, yaw);
+
+                writeLogRecord(ch,
+                    q0[ch], q1[ch], q2[ch], q3[ch],
+                    roll, pitch, yaw,
+                    ax, ay, az,
+                    gx_degs, gy_degs, gz_degs,
+                    fhl, ffl, fhr, ffr, 0);
+            }
+            tcaCloseAll();
+
+            // Flush to SD every 2 seconds to reduce data loss risk
+            if (millis() - lastFlush > 2000) {
+                flushLog();
+                lastFlush = millis();
+            }
+            delay(5);  // 200Hz
+        }
+#endif
             break;
 
         case 6:
@@ -638,8 +955,19 @@ void loop() {
             delay(10);
             break;
 
+        // ----------------------------------------
+        // MODE 11: WiFi HTTP file server
+        // Serves SD card .bin logs for download.
+        // Run fetch_log.py on laptop to pull files.
+        // ----------------------------------------
+        case 11:
+#if MODE_SELECT == 11
+            httpServer.handleClient();
+#endif
+            break;
+
         default:
-            Serial.println("Invalid mode — set MODE_SELECT to 1-9");
+            Serial.println("Invalid mode — set MODE_SELECT to 1-11");
             delay(1000);
             break;
     }
