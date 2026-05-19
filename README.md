@@ -52,7 +52,7 @@ project_stridesync/
 | Component | Detail |
 |---|---|
 | Microcontroller | ESP32 DevKit V1 (38-pin), PlatformIO + Arduino framework |
-| IMU | 6x MPU-6050 (GY-521) via PCA9548A I2C multiplexer (addr 0x70) |
+| IMU | 6x MPU-6050 (GY-521) via TCA9548A I2C multiplexer (addr 0x70) |
 | IMU I2C | SDA=GPIO21, SCL=GPIO22, 100 kHz, 5 kOhm external pull-ups |
 | FSR | 4x FSR-402 in 10 kOhm voltage divider, GPIO32 (L-heel), GPIO33 (L-fore), GPIO34 (R-heel), GPIO35 (R-fore) |
 | SD card | SanDisk 16 GB Class 10 microSD, SPI: CLK=18, MISO=19, MOSI=23, CS=5 |
@@ -355,7 +355,7 @@ A symmetry index >10% warrants investigation; it can indicate injury compensatio
 **"No IMUs found: check wiring"**
 - Verify SDA/SCL on GPIO 21/22
 - Check 5 kOhm pull-up resistors on SDA and SCL
-- Verify PCA9548A A0/A1/A2 tied to GND (address 0x70)
+- Verify TCA9548A A0/A1/A2 tied to GND (address 0x70)
 - Power cycle and retry
 
 **"SD init failed: check wiring"**
