@@ -233,7 +233,7 @@ Re-upload with PlatformIO (`Ctrl+Alt+U`).
 
 ### Treadmill / Indoor Run: WiFi Streaming (Mode 4, planned)
 
-Not yet implemented. When built, Mode 4 will stream UDP packets to a Python receiver on your laptop in real time, writing a CSV automatically. The planned packet structure is documented in `STRIDESYNC_CONTEXT.md`.
+Not yet implemented. When built, Mode 4 will stream UDP packets to a Python receiver on your laptop in real time, writing a CSV automatically.
 
 ---
 
