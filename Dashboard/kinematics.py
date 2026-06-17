@@ -68,8 +68,11 @@ def get_skeleton_frame(
 ) -> tuple:
     """Return (left_pts, right_pts) for a single frame. O(1) per call."""
     row       = wide_df.iloc[idx]
-    left_hip  = np.array([-HIP_SEPARATION / 2, 0.0, 0.0])
-    right_hip = np.array([ HIP_SEPARATION / 2, 0.0, 0.0])
+    # Hip lateral offset is mirrored vs world +X so left/right render correctly
+    # when the scene is viewed from behind the runner (the natural orientation,
+    # inferred from which way the legs swing back).
+    left_hip  = np.array([ HIP_SEPARATION / 2, 0.0, 0.0])
+    right_hip = np.array([-HIP_SEPARATION / 2, 0.0, 0.0])
     try:
         left  = reconstruct_skeleton(_get_q(row, 2), _get_q(row, 1), _get_q(row, 0), left_hip)
         right = reconstruct_skeleton(_get_q(row, 5), _get_q(row, 4), _get_q(row, 3), right_hip)

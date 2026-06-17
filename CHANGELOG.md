@@ -5,3 +5,4 @@
 - Verified no other missing dependencies in Dashboard or ESP32 (ESP32's `lib_deps` in `platformio.ini` already cover everything `main.cpp` uses).
 - Added `venv/` to `.gitignore`.
 - Removed stray tracked `Dashboard/errors.txt` (large runtime debug log, same class of issue as the earlier `debug.log` cleanup) and added `errors.txt` to `.gitignore`.
+- Fixed left/right being visually mirrored in the 3D skeleton animation: `kinematics.get_skeleton_frame` now places the left hip at +X and right hip at -X. Channel-to-side mapping (ch0-2=Left, ch3-5=Right, hardware-verified) and joint-angle computation were already correct — only the rendered hip lateral position was swapped.
